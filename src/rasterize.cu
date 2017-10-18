@@ -51,6 +51,7 @@ namespace {
 		int currentIndex; // The current last primitive set
 		glm::ivec2 from; // AABB min
 		glm::ivec2 to; // AABB max
+		int parentIndex;
 	};
 
 	struct VertexOut {
@@ -121,8 +122,8 @@ namespace {
 
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
 
-static int TILE_SIZE = 16; // In pixels
-static int TILE_PRIMITIVE_CAPACITY_BASE = 16384;
+static int TILE_SIZE = 4; // In pixels
+static int TILE_PRIMITIVE_CAPACITY_BASE = 4096;
 
 static int width = 0;
 static int height = 0;
@@ -133,6 +134,7 @@ static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
+static int * dev_fragmentMutex = NULL;
 
 static RenderTile * dev_tile_headers = NULL; // Tile information
 static int * dev_tile_primitives = NULL; // The tile primitive indices
@@ -191,15 +193,18 @@ void rasterizeInit(int w, int h) {
 	cudaFree(dev_fragmentBuffer);
 	cudaMalloc(&dev_fragmentBuffer, width * height * sizeof(Fragment));
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-    cudaFree(dev_framebuffer);
+    
+	cudaFree(dev_framebuffer);
     cudaMalloc(&dev_framebuffer,   width * height * sizeof(glm::vec3));
     cudaMemset(dev_framebuffer, 0, width * height * sizeof(glm::vec3));
 
+	cudaMalloc(&dev_fragmentMutex, width * height * sizeof(int));
+	cudaMemset(dev_fragmentMutex, 0, width * height * sizeof(int));
+
 	int maxDimension = glm::max(w, h);
-	int maxSubdivisions = 10;
+	int maxSubdivisions = 16;
 	int tileHeaderMemory = 0;
 	int tilePrimitiveMemory = 0;
-
 
 	// Find the amount of subdivisions we will need
 	for (int i = 0; i < maxSubdivisions; i++)
@@ -217,7 +222,7 @@ void rasterizeInit(int w, int h) {
 		}
 	}
 
-	effectiveTileSubdivisions = glm::min(effectiveTileSubdivisions, 1);
+	effectiveTileSubdivisions = glm::max(effectiveTileSubdivisions, 1);
 	
 	// Build the render tile header data
 	int tileOffset = 0;
@@ -249,6 +254,11 @@ void rasterizeInit(int w, int h) {
 				tile.to = glm::clamp(glm::vec2((x+1) * tile.tileLength, (y+1) * tile.tileLength), glm::vec2(0.f), glm::vec2(width, height));
 				tile.primitiveOffset = currentPrimitiveOffset + ((y * tileCount) + x) * tile.capacity;
 
+				// Precompute the next parent tile index
+				int parentX = x / 2;
+				int parentY = y / 2;
+				tile.parentIndex = tileOffset + (tileCount * tileCount) + parentY * (tileCount/2) + parentX;
+
 				tileHeaderData[tileOffset + (y * tileCount) + x] = tile;
 			}
 		}
@@ -263,7 +273,7 @@ void rasterizeInit(int w, int h) {
 	
 	printf("Size [%d,%d] | Tile subdivisions: %d \n", w, h, effectiveTileSubdivisions);
 	printf("Tile header memory: %f MB | Tile primitive memory: %f MB \n", tileHeaderMemory / (1024.f * 1024.f), (tilePrimitiveMemory / (1024.f * 1024.f)));
-
+	
 	int subdivisionMemory = effectiveTileSubdivisions * sizeof(RenderSubdivision);
 
 	cudaMalloc(&dev_subdivisions, subdivisionMemory);
@@ -742,17 +752,15 @@ void _vertexTransformAndAssembly(int numVertices, PrimitiveDevBufPointers primit
 	int vid = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (vid < numVertices) 
 	{
-		int index = primitive.dev_indices[vid];
-		glm::vec3 p = primitive.dev_position[index];
-
-		glm::vec3 n = primitive.dev_normal[index];
+		glm::vec3 p = primitive.dev_position[vid];
+		glm::vec3 n = primitive.dev_normal[vid];
 		glm::vec3 eyeNormal = MV_normal * n;
 		glm::vec3 eyePos = glm::vec3(MV * glm::vec4(p, 1.f));
 
 		glm::vec4 ssPos = MVP * glm::vec4(p, 1.f);
 		ssPos /= ssPos.w;
 		ssPos.x = (ssPos.x * .5f + .5f) * width;
-		ssPos.y = (ssPos.y * .5f + .5f) * height;
+		ssPos.y = (ssPos.y * -.5f + .5f) * height;
 
 		VertexOut out;
 		out.pos = ssPos;
@@ -780,25 +788,66 @@ void clearTileIndices(int totalTileCount, RenderTile * dev_tile_header)
 		dev_tile_header[index].currentIndex = 0;
 }
 
+// Pineda
+__forceinline__
+__host__ __device__
+float edgeFunction(glm::vec2 &a, glm::vec2  &b, glm::vec2 &c)
+{
+	return ((c[0] - a[0]) * (b[1] - a[1])) - ((c[1] - a[1]) * (b[0] - a[0]));
+}
+
 __global__
-void rasterizeTiles(int numTiles, int width, int height, RenderSubdivision subdivision, RenderTile * dev_tile_header, int * dev_tile_primitives, Primitive* dev_primitives, Fragment *dev_fragmentBuffer)
+void rasterizeTiles(int numTiles, int numSubdivisions, int width, int height, RenderSubdivision * dev_subdivisions, RenderTile * dev_tile_header, int * dev_tile_primitives, Primitive* dev_primitives, Fragment *dev_fragmentBuffer, int * dev_fragmentMutex)
 {
 	int index = (blockIdx.x * blockDim.x) + threadIdx.x;
 
 	if (index < numTiles)
 	{
-		RenderTile & tile = dev_tile_header[subdivision.tileOffset + index];
+		// Base tile is always smallest
+		RenderTile & baseTile = dev_tile_header[index];
 
-		for (int y = tile.from.y + 1; y <= tile.to.y - 1; y++)
+		for (int y = baseTile.from.y + 1; y <= baseTile.to.y - 1; y++)
 		{
-			for (int x = tile.from.x + 1; x <= tile.to.x - 1; x++)
+			for (int x = baseTile.from.x + 1; x <= baseTile.to.x - 1; x++)
 			{
-				int fragIndex = y * width + x;
-				float primitives = tile.currentIndex / (float)tile.capacity;
+				glm::vec2 point = glm::vec2(x, y);
+				Fragment resultFragment;
 
-				Fragment frag;
-				frag.color = glm::vec3(primitives);
-				dev_fragmentBuffer[fragIndex] = frag;
+				RenderTile * tile = &baseTile;
+				for (int i = 0; i < numSubdivisions; i++)
+				{
+					int totalPrimitives = glm::min(tile->currentIndex, tile->capacity);
+
+					for (int p = 0; p < totalPrimitives; p++)
+					{
+						int primitiveIndex = dev_tile_primitives[tile->primitiveOffset + p];
+						Primitive & prim = dev_primitives[primitiveIndex];
+
+						if (x >= prim.min.x && x <= prim.max.x && y >= prim.min.y && y <= prim.max.y)
+						{
+							glm::vec2 v0 = glm::vec2(prim.v[0].pos);
+							glm::vec2 v1 = glm::vec2(prim.v[1].pos);
+							glm::vec2 v2 = glm::vec2(prim.v[2].pos);
+
+							bool inside = true;
+							inside &= edgeFunction(v0, v1, point) > 0.f;
+							inside &= edgeFunction(v1, v2, point) > 0.f;
+							inside &= edgeFunction(v2, v0, point) > 0.f;
+
+							if (inside)
+							{
+								resultFragment.color = glm::vec3(1.f);// glm::vec3(glm::abs(prim.v[0].eyeNor.z));
+							}
+						}
+					}
+
+					// Jump to parent tile
+					if (i < numSubdivisions)
+						tile = &dev_tile_header[tile->parentIndex];
+				}
+				
+				int fragIndex = y * width + x;
+				dev_fragmentBuffer[fragIndex] = resultFragment;
 			}
 		}
 	}
@@ -837,7 +886,7 @@ void updateTiles(int numPrimitives, int w, int h, int tileSubdivisions, int base
 
 			// If the size of this triangle is comparable to the tile size, stop at this level
 			// Also stop if this is the last subdivisions (__very__ large triangles)
-			if (affectedTiles <= 3 || i == tileSubdivisions - 1)
+			if (affectedTiles <= 4 || i == tileSubdivisions - 1)
 			{
 				int tileCount = dev_subdivisions[i].tileCount;
 				int tileOffset = dev_subdivisions[i].tileOffset;
@@ -938,6 +987,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		checkCUDAError("Vertex Processing and Primitive Assembly");
 	}
 	
+	cudaMemset(dev_fragmentMutex, 0, width * height * sizeof(int));
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
 	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
 
@@ -953,15 +1003,9 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		TILE_SIZE, dev_primitives, dev_tile_headers, dev_tile_primitives, dev_subdivisions);
 
 	// Rasterize tiles
-	//for (int i = 0; i < effectiveTileSubdivisions; i++)
-	{
-		RenderSubdivision subdiv = subdivisionData[0];
-		int totalTiles = subdiv.tileCount * subdiv.tileCount;
-		dim3 blockCountForRasterization((totalTiles - 1) / numThreadsPerBlockTiles.x + 1);
-		rasterizeTiles << <blockCountForRasterization, numThreadsPerBlockTiles >> > (totalTiles, width, height, subdiv, dev_tile_headers, dev_tile_primitives, dev_primitives, dev_fragmentBuffer);
-	}
-
-	// TODO: rasterize
+	int totalTiles = subdivisionData[0].tileCount * subdivisionData[0].tileCount;
+	dim3 blockCountForRasterization((totalTiles - 1) / numThreadsPerBlockTiles.x + 1);
+	rasterizeTiles << <blockCountForRasterization, numThreadsPerBlockTiles >> > (totalTiles, effectiveTileSubdivisions, width, height, dev_subdivisions, dev_tile_headers, dev_tile_primitives, dev_primitives, dev_fragmentBuffer, dev_fragmentMutex);
 
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
