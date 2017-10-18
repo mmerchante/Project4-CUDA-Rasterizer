@@ -1,6 +1,7 @@
 CUDA Rasterizer
 ===============
 
+![](renders/header.png)
 **University of Pennsylvania, CIS 565: GPU Programming and Architecture, Project 4**
 
 * Mariano Merchante
@@ -33,6 +34,18 @@ Because most of the effort was put into the tiled rendering approach, no fancy m
 - Backface culling
 - Early Z-reject 
 - Pineda algorithm for triangle rasterization
+
+
+# Overdraw and early rejection
+Note that when early rejection is enabled, primitive overdraw is reduced because triangles are discarded before doing per fragment z-testing.
+
+![](renders/overdraw.png)
+
+Overdraw without early reject
+
+![](renders/overdraw_early.png)
+
+Overdraw with early reject
    
 ## Results
 This approach seems to be very good when the geometry is balanced throughout different tile levels. If, for example, the full scene can be placed on one small tile, performance can drop dramatically, and can even lose primitives. This can be mitigated by doing multiple passes until all geometry is rasterized, but it is not implemented.
@@ -40,6 +53,8 @@ This approach seems to be very good when the geometry is balanced throughout dif
 Memory consumption is a big issue too, and the logarithmic scale used for different hierarchy capacities is used to mitigate the fact that as tiles become bigger, more primitives are going to intersect with them. 
 
 As expected, the results are also very dependent on the tile size, the amount of subdivisions, and also the threshold used for placing primitives at specific levels of the hierarchy.
+
+An important distinction is that this approach does not use shared memory, so 16x16 tiles are actually really slow because of global memory access. When tiles are smaller, around 4x4, the algorithm benefits from cache accesses and performance improves drastically.
 
 ## Improvements
 * The fixed, preallocated primitive memory is not ideal, and maybe extending the atomic counter idea to a dynamic global list may be useful at different hierarchy levels.
