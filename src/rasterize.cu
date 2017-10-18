@@ -79,16 +79,9 @@ namespace {
 
 	struct Fragment {
 		glm::vec3 color;
-
-		// TODO: add new attributes to your Fragment
-		// The attributes listed below might be useful, 
-		// but always feel free to modify on your own
-
-		glm::vec3 eyePos;	// eye space position used for shading
+		glm::vec3 eyePos;
 		glm::vec3 eyeNor;
-		// VertexAttributeTexcoord texcoord0;
-		// TextureData* dev_diffuseTex;
-		// ...
+		int overdraw;
 	};
 
 	struct PrimitiveDevBufPointers {
@@ -122,8 +115,8 @@ namespace {
 
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
 
-static int TILE_SIZE = 4; // In pixels
-static int TILE_PRIMITIVE_CAPACITY_BASE = 4096;
+static int TILE_SIZE = 2; // In pixels
+static int TILE_PRIMITIVE_CAPACITY_BASE = 512;
 
 static int width = 0;
 static int height = 0;
@@ -141,8 +134,6 @@ static int * dev_tile_primitives = NULL; // The tile primitive indices
 static RenderSubdivision  * dev_subdivisions = NULL; // The offsets for each subdivision level
 
 static RenderSubdivision * subdivisionData = NULL; // Client!
-
-static int * dev_depth = NULL;	// you might need this buffer when doing depth test
 
 
 /**
@@ -177,11 +168,8 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
     int index = x + (y * w);
 
-    if (x < w && y < h) {
-        framebuffer[index] = fragmentBuffer[index].color;
-
-		// TODO: add your fragment shader code here
-    }
+    if (x < w && y < h) 
+		framebuffer[index] = glm::pow(glm::max(fragmentBuffer[index].color, glm::vec3(0.f)), glm::vec3(.454f)); 
 }
 
 /**
@@ -202,7 +190,7 @@ void rasterizeInit(int w, int h) {
 	cudaMemset(dev_fragmentMutex, 0, width * height * sizeof(int));
 
 	int maxDimension = glm::max(w, h);
-	int maxSubdivisions = 16;
+	int maxSubdivisions = 8;
 	int tileHeaderMemory = 0;
 	int tilePrimitiveMemory = 0;
 
@@ -213,7 +201,7 @@ void rasterizeInit(int w, int h) {
 		int tileCount = glm::ceil(maxDimension / (float)tileSize);
 
 		totalTiles += tileCount * tileCount;
-		tilePrimitiveMemory += tileCount * tileCount * TILE_PRIMITIVE_CAPACITY_BASE * sizeof(int);
+		tilePrimitiveMemory += tileCount * tileCount * TILE_PRIMITIVE_CAPACITY_BASE * sizeof(int) * glm::log(i + 2);
 		
 		if (tileSize >= maxDimension)
 		{
@@ -239,7 +227,7 @@ void rasterizeInit(int w, int h) {
 		tile.currentIndex = 0; // No primitives yet! This index must be cleared on each frame
 
 		int tileCount = glm::ceil(maxDimension / (float)tile.tileLength);
-		tile.capacity = TILE_PRIMITIVE_CAPACITY_BASE; // For now, tile capacity is constant (TODO: make it dynamic)
+		tile.capacity = TILE_PRIMITIVE_CAPACITY_BASE * glm::log(i + 2);
 
 		// Precompute some information for this subdivision level
 		subdivisionData[i].tileOffset = tileOffset;
@@ -257,7 +245,7 @@ void rasterizeInit(int w, int h) {
 				// Precompute the next parent tile index
 				int parentX = x / 2;
 				int parentY = y / 2;
-				tile.parentIndex = tileOffset + (tileCount * tileCount) + parentY * (tileCount/2) + parentX;
+				tile.parentIndex = tileOffset + (tileCount * tileCount) + (parentY * (tileCount/2)) + parentX;
 
 				tileHeaderData[tileOffset + (y * tileCount) + x] = tile;
 			}
@@ -289,8 +277,6 @@ void rasterizeInit(int w, int h) {
 	cudaMalloc(&dev_tile_primitives, tilePrimitiveMemory);
 	cudaMemset(dev_tile_primitives, -1, tilePrimitiveMemory); // -1 means invalid index!
     
-	cudaFree(dev_depth);
-	cudaMalloc(&dev_depth, width * height * sizeof(int));
 
 	checkCUDAError("rasterizeInit"); 
 }
@@ -758,24 +744,20 @@ void _vertexTransformAndAssembly(int numVertices, PrimitiveDevBufPointers primit
 		glm::vec3 eyePos = glm::vec3(MV * glm::vec4(p, 1.f));
 
 		glm::vec4 ssPos = MVP * glm::vec4(p, 1.f);
-		ssPos /= ssPos.w;
+
+		if(ssPos.w != 0.f)
+			ssPos /= ssPos.w;
+
 		ssPos.x = (ssPos.x * .5f + .5f) * width;
 		ssPos.y = (ssPos.y * -.5f + .5f) * height;
+		ssPos.z = 1.f / eyePos.z;		
 
 		VertexOut out;
 		out.pos = ssPos;
 		out.eyePos = eyePos;
-		out.eyeNor = eyeNormal;
+		out.eyeNor = eyeNormal;		
 
 		primitive.dev_verticesOut[vid] = out;
-
-		// TODO: Apply vertex transformation here
-		// Multiply the MVP matrix for each vertex position, this will transform everything into clipping space
-		// Then divide the pos by its w element to transform into NDC space
-		// Finally transform x and y to viewport space
-
-		// TODO: Apply vertex assembly here
-		// Assemble all attribute arraies into the primitive array
 	}
 }
 
@@ -806,12 +788,16 @@ void rasterizeTiles(int numTiles, int numSubdivisions, int width, int height, Re
 		// Base tile is always smallest
 		RenderTile & baseTile = dev_tile_header[index];
 
-		for (int y = baseTile.from.y + 1; y <= baseTile.to.y - 1; y++)
+		for (int y = baseTile.from.y; y < baseTile.to.y; y++)
 		{
-			for (int x = baseTile.from.x + 1; x <= baseTile.to.x - 1; x++)
+			for (int x = baseTile.from.x; x < baseTile.to.x; x++)
 			{
 				glm::vec2 point = glm::vec2(x, y);
 				Fragment resultFragment;
+				resultFragment.color = glm::vec3(0.f);
+				
+				float depth = 2000.f;
+				int overdraw = 0;
 
 				RenderTile * tile = &baseTile;
 				for (int i = 0; i < numSubdivisions; i++)
@@ -823,27 +809,62 @@ void rasterizeTiles(int numTiles, int numSubdivisions, int width, int height, Re
 						int primitiveIndex = dev_tile_primitives[tile->primitiveOffset + p];
 						Primitive & prim = dev_primitives[primitiveIndex];
 
+						// Early Z reject
+						if (-1.f / prim.min.z > depth)
+							continue;
+
 						if (x >= prim.min.x && x <= prim.max.x && y >= prim.min.y && y <= prim.max.y)
 						{
 							glm::vec2 v0 = glm::vec2(prim.v[0].pos);
 							glm::vec2 v1 = glm::vec2(prim.v[1].pos);
 							glm::vec2 v2 = glm::vec2(prim.v[2].pos);
 
-							bool inside = true;
-							inside &= edgeFunction(v0, v1, point) > 0.f;
-							inside &= edgeFunction(v1, v2, point) > 0.f;
-							inside &= edgeFunction(v2, v0, point) > 0.f;
+							float area = edgeFunction(v0, v1, v2);
+							float u = edgeFunction(v1, v2, point);
+							float v = edgeFunction(v2, v0, point);
+							float w = edgeFunction(v0, v1, point);
 
-							if (inside)
+							if(u >= 0 && v >= 0 && w >= 0) 
 							{
-								resultFragment.color = glm::vec3(1.f);// glm::vec3(glm::abs(prim.v[0].eyeNor.z));
+								u /= area;
+								v /= area;
+								w /= area;
+
+								float interpolatedDepth = u * prim.v[0].pos.z + v * prim.v[1].pos.z + w * prim.v[2].pos.z;
+								
+								if(interpolatedDepth != 0.f)
+									interpolatedDepth = -1.f / interpolatedDepth;
+
+								if (interpolatedDepth < depth)
+								{
+									depth = interpolatedDepth;
+									resultFragment.eyePos = prim.v[0].eyePos * u + prim.v[1].eyePos * v + prim.v[2].eyePos * w;
+									resultFragment.eyeNor = prim.v[0].eyeNor * u + prim.v[1].eyeNor * v + prim.v[2].eyeNor * w;
+								}
+
+								overdraw++;
 							}
 						}
 					}
 
 					// Jump to parent tile
-					if (i < numSubdivisions)
+					if (i < numSubdivisions - 1)
 						tile = &dev_tile_header[tile->parentIndex];
+				}
+
+				resultFragment.overdraw = overdraw;
+
+				if (overdraw > 0)
+				{
+					// Fragment shader code
+					glm::vec3 toLightEye = glm::normalize(glm::vec3(1.f));
+					glm::vec3 R = glm::reflect(toLightEye, resultFragment.eyeNor);
+
+					float cosTheta = glm::dot(resultFragment.eyeNor, toLightEye) * .5f;
+					float ratio = glm::pow(1.0f - resultFragment.eyeNor.z, 2.f) * .35f;
+					float bounce = glm::max(0.f, -glm::dot(resultFragment.eyeNor, toLightEye)) * .35f;
+					float specular = glm::pow(R.z, 16.f) * .5f;
+					resultFragment.color = glm::vec3(cosTheta + ratio + bounce + specular);
 				}
 				
 				int fragIndex = y * width + x;
@@ -870,9 +891,12 @@ void updateTiles(int numPrimitives, int w, int h, int tileSubdivisions, int base
 		p.min = glm::min(glm::vec3(v1), glm::min(glm::vec3(v2), glm::vec3(v3)));
 		p.max = glm::max(glm::vec3(v1), glm::max(glm::vec3(v2), glm::vec3(v3)));
 
+		// Ignore primitives behind
+		if (p.max.z > 0.f)
+			return;
+
 		glm::vec2 screenMin = glm::vec2(p.min);
 		glm::vec2 screenMax = glm::vec2(p.max);
-
 		glm::vec2 screenSize = glm::abs(glm::vec2(p.max) - glm::vec2(p.min));
 
 		for (int i = 0; i < tileSubdivisions; ++i)
@@ -941,8 +965,6 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 	}
 }
 
-
-
 /**
  * Perform rasterization.
  */
@@ -989,23 +1011,28 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	
 	cudaMemset(dev_fragmentMutex, 0, width * height * sizeof(int));
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
 
 	// Clear tile indices
 	dim3 blockSizeTiles(64);
 	dim3 blockCountTiles((totalTiles - 1) / blockSizeTiles.x + 1);
 	clearTileIndices << <blockCountTiles, blockSizeTiles >> >(totalTiles, dev_tile_headers);
 
+	cudaDeviceSynchronize();
+
 	// Update tile data
-	dim3 numThreadsPerBlockTiles(64);
+	dim3 numThreadsPerBlockTiles(128);
 	dim3 blockCountForPrimitives((totalNumPrimitives - 1) / numThreadsPerBlockTiles.x + 1);
 	updateTiles << <blockCountForPrimitives, numThreadsPerBlockTiles >> > (totalNumPrimitives, width, height, effectiveTileSubdivisions,
 		TILE_SIZE, dev_primitives, dev_tile_headers, dev_tile_primitives, dev_subdivisions);
+
+	cudaDeviceSynchronize();
 
 	// Rasterize tiles
 	int totalTiles = subdivisionData[0].tileCount * subdivisionData[0].tileCount;
 	dim3 blockCountForRasterization((totalTiles - 1) / numThreadsPerBlockTiles.x + 1);
 	rasterizeTiles << <blockCountForRasterization, numThreadsPerBlockTiles >> > (totalTiles, effectiveTileSubdivisions, width, height, dev_subdivisions, dev_tile_headers, dev_tile_primitives, dev_primitives, dev_fragmentBuffer, dev_fragmentMutex);
+
+	cudaDeviceSynchronize();
 
     // Copy depthbuffer colors into framebuffer
 	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
@@ -1049,9 +1076,6 @@ void rasterizeFree() {
 
     cudaFree(dev_framebuffer);
     dev_framebuffer = NULL;
-
-	cudaFree(dev_depth);
-	dev_depth = NULL;
 
     checkCUDAError("rasterize Free");
 }
