@@ -13,6 +13,8 @@ CUDA Rasterizer
 ## Details
 This project implements a hierarchical tiled rasterizer in CUDA. It subdivides the screen multiple times and stores polygon data at different levels to optimize memory usage, and then traverses through this hierarchy when rendering.
 
+A video can be found [here](https://vimeo.com/238739035)
+
 ## Rasterization
 The rasterization aspect is very similar to other approaches, with the difference that instead of iterating through all primitives and doing scanline rasterization, it follows these steps:
 
@@ -20,9 +22,11 @@ The rasterization aspect is very similar to other approaches, with the differenc
   - It uses a logarithmic scale to increase the primitive capacity as the tile becomes bigger.
 - On each frame:
   - Clears every tile primitive counter
-  - Iterates over all primitives and stores them at the correct level on the hierarchy. It uses an atomic counter to keep track of how many primitives the tile must render.
+  - Iterates over all primitives and stores them at the correct level on the hierarchy. It uses an atomic counter to keep track of how many primitives the tile must render. To select which level to store the primitive, it checks with how many tiles it intersects.
   - Rasterizes each tile, iterating through all found primitives and up through the hierarchy until the biggest level is reached.
     - Note that because each tile is running in parallel, z testing has no race condition and thus can be trivially done in the tile kernel.
+    
+Because most of the effort was put into the tiled rendering approach, no fancy methods such as texturing, AA or image effects were implemented, given that these are usually trivial.
     
 ## Specific optimizations
 
@@ -31,12 +35,15 @@ The rasterization aspect is very similar to other approaches, with the differenc
 - Pineda algorithm for triangle rasterization
    
 ## Results
-This approach seems to be very good when the geometry is balanced throughout different tile levels. If, for example, the full scene can be stored on one small tile, performance can drop dramatically, and can even lose primitives. This can be mitigated by doing multiple passes until all geometry is rasterized, but it is not implemented.
+This approach seems to be very good when the geometry is balanced throughout different tile levels. If, for example, the full scene can be placed on one small tile, performance can drop dramatically, and can even lose primitives. This can be mitigated by doing multiple passes until all geometry is rasterized, but it is not implemented.
 
 Memory consumption is a big issue too, and the logarithmic scale used for different hierarchy capacities is used to mitigate the fact that as tiles become bigger, more primitives are going to intersect with them. 
 
+As expected, the results are also very dependent on the tile size, the amount of subdivisions, and also the threshold used for placing primitives at specific levels of the hierarchy.
 
-
+## Improvements
+* The fixed, preallocated primitive memory is not ideal, and maybe extending the atomic counter idea to a dynamic global list may be useful at different hierarchy levels.
+* Automatically optimizing certain parameters, such as tile size, subdivision levels, coverage count, etc. for the specified scene data could be interesting.
 
 ### Credits
 
