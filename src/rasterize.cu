@@ -115,8 +115,8 @@ namespace {
 
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
 
-static int TILE_SIZE = 2; // In pixels
-static int TILE_PRIMITIVE_CAPACITY_BASE = 512;
+static int TILE_SIZE = 4; // In pixels
+static int TILE_PRIMITIVE_CAPACITY_BASE = 1024;
 
 static int width = 0;
 static int height = 0;
@@ -910,7 +910,7 @@ void updateTiles(int numPrimitives, int w, int h, int tileSubdivisions, int base
 
 			// If the size of this triangle is comparable to the tile size, stop at this level
 			// Also stop if this is the last subdivisions (__very__ large triangles)
-			if (affectedTiles <= 4 || i == tileSubdivisions - 1)
+			if (affectedTiles <= 6 || i == tileSubdivisions - 1)
 			{
 				int tileCount = dev_subdivisions[i].tileCount;
 				int tileOffset = dev_subdivisions[i].tileOffset;
