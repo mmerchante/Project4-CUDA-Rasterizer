@@ -17,6 +17,7 @@
 #include "rasterize.h"
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <device_launch_parameters.h>
 
 namespace {
 
@@ -32,6 +33,14 @@ namespace {
 		Point = 1,
 		Line = 2,
 		Triangle = 3
+	};
+
+	struct RenderTile {
+		int tileLength; // The size in pixels
+		int tileLevel;	// Subdivision level
+		int bufferIndex; // The index on the tile buffer
+		int capacity; // The amount of primitives that can hold
+		int currentIndex; // The current last primitive set
 	};
 
 	struct VertexOut {
@@ -53,6 +62,8 @@ namespace {
 	struct Primitive {
 		PrimitiveType primitiveType = Triangle;	// C++ 11 init
 		VertexOut v[3];
+		glm::vec3 min;
+		glm::vec3 max;
 	};
 
 	struct Fragment {
@@ -62,8 +73,8 @@ namespace {
 		// The attributes listed below might be useful, 
 		// but always feel free to modify on your own
 
-		// glm::vec3 eyePos;	// eye space position used for shading
-		// glm::vec3 eyeNor;
+		glm::vec3 eyePos;	// eye space position used for shading
+		glm::vec3 eyeNor;
 		// VertexAttributeTexcoord texcoord0;
 		// TextureData* dev_diffuseTex;
 		// ...
@@ -100,16 +111,24 @@ namespace {
 
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
 
+static int TILE_SIZE = 16; // In pixels
+static int TILE_PRIMITIVE_CAPACITY_BASE = 16384;
 
 static int width = 0;
 static int height = 0;
+static int effectiveTileSubdivisions = 0;
 
 static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
+static RenderTile * dev_tile_headers = NULL; // Tile information
+static int * dev_tile_primitives = NULL; // The tile primitive indices
+static int * dev_tile_offsets = NULL; // The offsets for each subdivision level
+
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+
 
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
@@ -125,6 +144,7 @@ void sendImageToPBO(uchar4 *pbo, int w, int h, glm::vec3 *image) {
         color.x = glm::clamp(image[index].x, 0.0f, 1.0f) * 255.0;
         color.y = glm::clamp(image[index].y, 0.0f, 1.0f) * 255.0;
         color.z = glm::clamp(image[index].z, 0.0f, 1.0f) * 255.0;
+
         // Each thread writes one pixel location in the texture (textel)
         pbo[index].w = 0;
         pbo[index].x = color.x;
@@ -143,10 +163,9 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
     int index = x + (y * w);
 
     if (x < w && y < h) {
-        framebuffer[index] = fragmentBuffer[index].color;
+        framebuffer[index] = fragmentBuffer[index].eyeNor;
 
 		// TODO: add your fragment shader code here
-
     }
 }
 
@@ -162,11 +181,78 @@ void rasterizeInit(int w, int h) {
     cudaFree(dev_framebuffer);
     cudaMalloc(&dev_framebuffer,   width * height * sizeof(glm::vec3));
     cudaMemset(dev_framebuffer, 0, width * height * sizeof(glm::vec3));
+
+	int maxDimension = glm::max(w, h);
+	int maxSubdivisions = 10;
+	int tileHeaderMemory = 0;
+	int tilePrimitiveMemory = 0;
+
+
+	// Find the amount of subdivisions we will need
+	for (int i = 0; i < maxSubdivisions; i++)
+	{
+		int tileSize = TILE_SIZE * glm::pow(2, i);
+		int tileCount = glm::ceil(maxDimension / (float)tileSize);
+
+		tileHeaderMemory += tileCount * tileCount;
+		tilePrimitiveMemory += tileCount * tileCount * TILE_PRIMITIVE_CAPACITY_BASE * sizeof(int);
+		
+		if (tileSize >= maxDimension)
+		{
+			effectiveTileSubdivisions = i + 1;
+			break;
+		}
+	}
+	
+	// Build the render tile header data
+	int tileOffset = 0;
+	RenderTile * tileHeaderData = new RenderTile[tileHeaderMemory];
+	int * tileOffsets = new int[effectiveTileSubdivisions];
+
+	for (int i = 0; i < effectiveTileSubdivisions; i++)
+	{
+		tileOffsets[i] = tileOffset;
+
+		RenderTile tile;
+		tile.tileLevel = i;
+		tile.tileLength = TILE_SIZE * glm::pow(2, i);
+		tile.currentIndex = 0; // No primitives yet! This index must be cleared on each frame
+
+		int tileCount = glm::ceil(maxDimension / (float)tile.tileLength);
+		tile.capacity = tileCount * tileCount * TILE_PRIMITIVE_CAPACITY_BASE;
+
+		for (int y = 0; y < tileCount; ++y)
+		{
+			for (int x = 0; x < tileCount; ++x)
+			{
+				tile.bufferIndex = tileOffset + (y * tileCount) + x;
+				tileHeaderData[tile.bufferIndex] = tile;
+			}
+		}
+
+		printf("Tile offset for level %d : %d (buffer size: %d) \n", i, tileOffset, (tileCount * tileCount));
+
+		tileOffset += tileCount * tileCount;
+	}
+
+	tileHeaderMemory *= sizeof(RenderTile);
+	
+	printf("Size [%d,%d] | Tile subdivisions: %d \n", w, h, effectiveTileSubdivisions);
+	printf("Tile header memory: %f MB | Tile primitive memory: %f MB \n", tileHeaderMemory / (1024.f * 1024.f), (tilePrimitiveMemory / (1024.f * 1024.f)));
+
+	cudaMalloc(&dev_tile_offsets, effectiveTileSubdivisions * sizeof(int));
+	cudaMemcpy(&dev_tile_offsets, tileOffsets, effectiveTileSubdivisions * sizeof(int), cudaMemcpyHostToDevice);
+
+	cudaMalloc(&dev_tile_headers, tileHeaderMemory);
+	cudaMemcpy(&dev_tile_headers, tileHeaderData, tileHeaderMemory, cudaMemcpyHostToDevice);
+	
+	cudaMalloc(&dev_tile_primitives, tilePrimitiveMemory);
+	cudaMemset(&dev_tile_primitives, -1, tilePrimitiveMemory); // -1 means invalid index!
     
 	cudaFree(dev_depth);
 	cudaMalloc(&dev_depth, width * height * sizeof(int));
 
-	checkCUDAError("rasterizeInit");
+	checkCUDAError("rasterizeInit"); 
 }
 
 __global__
@@ -617,22 +703,33 @@ void rasterizeSetBuffers(const tinygltf::Scene & scene) {
 
 		checkCUDAError("Free BufferView Device Mem");
 	}
-
-
 }
 
-
-
 __global__ 
-void _vertexTransformAndAssembly(
-	int numVertices, 
-	PrimitiveDevBufPointers primitive, 
-	glm::mat4 MVP, glm::mat4 MV, glm::mat3 MV_normal, 
-	int width, int height) {
-
+void _vertexTransformAndAssembly(int numVertices, PrimitiveDevBufPointers primitive,  glm::mat4 MVP, glm::mat4 MV, glm::mat3 MV_normal, int width, int height) 
+{
 	// vertex id
 	int vid = (blockIdx.x * blockDim.x) + threadIdx.x;
-	if (vid < numVertices) {
+	if (vid < numVertices) 
+	{
+		int index = primitive.dev_indices[vid];
+		glm::vec3 p = primitive.dev_position[index];
+
+		glm::vec3 n = primitive.dev_normal[index];
+		glm::vec3 eyeNormal = MV_normal * n;
+		glm::vec3 eyePos = glm::vec3(MV * glm::vec4(p, 1.f));
+
+		glm::vec4 ssPos = MVP * glm::vec4(p, 1.f);
+		ssPos /= ssPos.w;
+		ssPos.x *= width;
+		ssPos.y *= height;
+
+		VertexOut out;
+		out.pos = ssPos;
+		out.eyePos = eyePos;
+		out.eyeNor = eyeNormal;
+
+		primitive.dev_verticesOut[vid] = out;
 
 		// TODO: Apply vertex transformation here
 		// Multiply the MVP matrix for each vertex position, this will transform everything into clipping space
@@ -641,36 +738,88 @@ void _vertexTransformAndAssembly(
 
 		// TODO: Apply vertex assembly here
 		// Assemble all attribute arraies into the primitive array
-		
 	}
 }
 
 
+__global__
+void updateTiles(int numPrimitives, int w, int h, int tileSubdivisions, int tileSize, Primitive* dev_primitives, RenderTile * dev_tile_header, int * dev_tile_primitives, int * dev_tile_offsets)
+{
+	int primitiveIndex = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+	if (primitiveIndex < numPrimitives)
+	{
+		Primitive & p = dev_primitives[primitiveIndex];
+		glm::vec4 v1 = p.v[0].pos;
+		glm::vec4 v2 = p.v[1].pos;
+		glm::vec4 v3 = p.v[2].pos;
+
+		// Get the AABB (with Z too, for early reject)
+		p.min = glm::min(glm::vec3(v1), glm::min(glm::vec3(v2), glm::vec3(v3)));
+		p.max = glm::max(glm::vec3(v1), glm::max(glm::vec3(v2), glm::vec3(v3)));
+
+		glm::vec2 screenMin = glm::vec2(p.min);
+		glm::vec2 screenMax = glm::vec2(p.max);
+
+		glm::vec2 screenSize = glm::abs(glm::vec2(p.max) - glm::vec2(p.min));
+		int tileLevel = 0;
+
+		for (int i = 0; i < tileSubdivisions; ++i)
+		{
+			// Bottom up!
+			int tileSizeW = tileSize * (i + 1);
+			int tileSizeH = tileSize * (i + 1);
+
+			glm::vec2 tileSize = glm::vec2(tileSizeW, tileSizeH);
+			glm::ivec2 sizeAtResolution = glm::ceil(screenSize / tileSize);
+
+			int affectedTiles = glm::max(sizeAtResolution.x, sizeAtResolution.y);
+
+			// If the size of this triangle is comparable to the tile size, stop at this level
+			// Also stop if this is the last subdivisions (__very__ large triangles)
+			if (affectedTiles <= 3 || i == tileSubdivisions - 1)
+			{
+				tileLevel = i + 1;
+
+				glm::ivec2 from = glm::floor(screenMin / tileSize);
+				glm::ivec2 to = glm::ceil(screenMax / tileSize);
+
+				// Now write into the tile buffer
+				for (int x = from.x; x <= to.x; ++x)
+				{
+					for (int y = from.y; y <= to.y; ++y)
+					{
+
+					}
+				}
+
+				// We already found our level, don't do anything else
+				return;
+			}
+		}
+	}
+}
 
 static int curPrimitiveBeginId = 0;
 
 __global__ 
-void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_primitives, PrimitiveDevBufPointers primitive) {
-
-	// index id
+void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_primitives, PrimitiveDevBufPointers primitive) 
+{
 	int iid = (blockIdx.x * blockDim.x) + threadIdx.x;
 
-	if (iid < numIndices) {
-
+	if (iid < numIndices) 
+	{
 		// TODO: uncomment the following code for a start
 		// This is primitive assembly for triangles
 
-		//int pid;	// id for cur primitives vector
-		//if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
-		//	pid = iid / (int)primitive.primitiveType;
-		//	dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
-		//		= primitive.dev_verticesOut[primitive.dev_indices[iid]];
-		//}
-
-
+		int pid;	// id for cur primitives vector
+		if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
+			pid = iid / (int)primitive.primitiveType;
+			dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
+				= primitive.dev_verticesOut[primitive.dev_indices[iid]];
+		}
 		// TODO: other primitive types (point, line)
 	}
-	
 }
 
 
